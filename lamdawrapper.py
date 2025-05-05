@@ -99,6 +99,10 @@ class AsyncLambdaCloudClient:
 
     async def _get(self, path: str) -> dict:
         assert self._client
+        if self._client.is_closed:
+            logger.debug("re-connect")
+            await self.__aenter__()
+
         url = self.BASE_URL + path
         logger.debug("GET %s", url)
         res = await self._client.get(url, headers=self._headers())
@@ -110,6 +114,10 @@ class AsyncLambdaCloudClient:
 
     async def _post(self, path: str, json: dict) -> dict:
         assert self._client
+        if self._client.is_closed:
+            logger.debug("re-connect")
+            await self.__aenter__()
+
         url = self.BASE_URL + path
         logger.debug("POST %s | body=%s", url, json)
         res = await self._client.post(url, headers=self._headers(), json=json)
@@ -278,6 +286,8 @@ class Instance:
         # 6) actions（使うなら中身を解析しても良い）
         actions = j.get("actions", {})
 
+        
+
         return cls(
             id=id_,
             name=name,
@@ -304,7 +314,7 @@ class Instance:
         logger.debug("refresh id=%s status=%s", self.id, self.status)
         return self
 
-    async def wait_until_active(self, timeout: int = 600, interval: int = 20) -> "Instance":
+    async def wait_until_active(self, timeout: int = 600, interval: int = 50) -> "Instance":
         start = time.time()
         logger.info("起動待機開始 id=%s (timeout=%ds)", self.id, timeout)
         while True:
@@ -317,7 +327,11 @@ class Instance:
             if time.time() - start > timeout:
                 logger.error("timeout (id=%s, status=%s)", self.id, self.status)
                 raise TimeoutError("wait_until_active タイムアウト")
+
             await asyncio.sleep(interval)
+            logger.debug("wait_until_active タイムアウトしました。 interval=%d", interval)
+            interval = max(int(interval * 0.8), 15)
+
 
     async def terminate(self) -> None:
         await self._client._terminate_instance(self.id)
@@ -337,7 +351,6 @@ async def launch(gpu=True, price_per_hour=2, name="my-instance-test", quantity=1
 
         print("------------------------")
         running_instances = await client.list_instances()
-        print(running_instances)
 
         for i in running_instances:
             if i.name.startswith(name):
@@ -346,7 +359,7 @@ async def launch(gpu=True, price_per_hour=2, name="my-instance-test", quantity=1
 
         print("------------------------")
         sshkeys = await client.list_ssh_keys()
-        print(sshkeys)
+        print("sshkeys", sshkeys)
 
         filter_over = {
             "gpus": 1 if gpu else 0,
@@ -375,6 +388,8 @@ async def launch(gpu=True, price_per_hour=2, name="my-instance-test", quantity=1
         if len(target_instances) == 0:
             print("フィルタに一致するインスタンスが見つかりませんでした。")
             return
+        
+        instance_object = None
 
         if len(running_instances) == 0:
             for i in target_instances:
@@ -394,11 +409,12 @@ async def launch(gpu=True, price_per_hour=2, name="my-instance-test", quantity=1
 
         # 2 稼働中一覧
         for i in await client.list_instances():
-            i.wait_until_active()
+            await i.wait_until_active()
+            instance_object = i
             print(i.id, i.status, i.ip)
 
         print("インスタンスの終了に成功しました。")
-        return
+        return instance_object
     
     # sudo apt install git-lfs
     # git lfs install
@@ -419,13 +435,30 @@ async def terminate():
 
 async def main():
     set_log_level(logging.DEBUG)  # 詳細ログ
+
     instance = await launch(gpu=True, price_per_hour=2, name="my-instance-test")
-
     print(instance)
-
     await asyncio.sleep(10)
 
-    #await terminate()
+    print("connection completed")
+
+    import paramiko
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    ssh.connect(instance.ip, username="ubuntu", key_filename=f"{instance.ssh_key_names[0]}.pem")
+    print("ssh connected")
+
+    commands = """\
+sudo apt update
+sudo apt -y install aria2
+
+"""
+    for command in commands.split("\n"):
+        command = command.strip()
+        if not command:
+            continue
+        stdin, stdout, stderr = ssh.exec_command(command)
+        print(stdout.read().decode())
 
     await instance.terminate()
 
